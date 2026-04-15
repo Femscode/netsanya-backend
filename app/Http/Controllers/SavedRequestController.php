@@ -12,9 +12,23 @@ class SavedRequestController extends Controller
 {
     public function index(Request $request)
     {
+        $workspaceId = $request->query('workspace_id');
+        $userId = $request->user()->getAuthIdentifier();
+
         $query = SavedRequest::query()
-            ->where('user_id', $request->user()->getAuthIdentifier())
+            ->where('user_id', $userId)
             ->with('collection:id,name');
+
+        if ($workspaceId) {
+            // Ensure user belongs to this workspace
+            if (!$request->user()->workspaces()->where('workspace_id', $workspaceId)->exists()) {
+                return response()->json(['message' => 'Unauthorized'], 403);
+            }
+            $query->where('workspace_id', $workspaceId);
+        } else {
+            // Fallback to all user's workspaces
+            $query->whereIn('workspace_id', $request->user()->workspaces()->pluck('workspaces.id'));
+        }
 
         if ($request->filled('collection_id')) {
             $query->where('collection_id', $request->integer('collection_id'));
@@ -32,6 +46,7 @@ class SavedRequestController extends Controller
     public function store(Request $request)
     {
         $data = $request->validate([
+            'workspace_id' => ['required', 'exists:workspaces,id'],
             'collection_id' => ['nullable', 'integer', 'exists:collections,id'],
             'name' => ['nullable', 'string', 'max:100'],
             'method' => ['required', 'string', 'in:GET,POST,PUT,PATCH,DELETE'],
@@ -44,20 +59,27 @@ class SavedRequestController extends Controller
             'body_form' => ['sometimes', 'nullable', 'array'],
             'auth_type' => ['sometimes', 'nullable', 'string', 'in:inherit,none,bearer,basic,api_key'],
             'auth_config' => ['sometimes', 'nullable', 'array'],
+            'last_response' => ['sometimes', 'nullable', 'array'],
         ]);
 
-        $collectionId = $data['collection_id'] ?? null;
         $userId = $request->user()->getAuthIdentifier();
+        $workspaceId = $data['workspace_id'];
+        $collectionId = $data['collection_id'] ?? null;
+
+        // Ensure user belongs to the workspace
+        if (!$request->user()->workspaces()->where('workspace_id', $workspaceId)->exists()) {
+            return response()->json(['message' => 'Unauthorized'], 403);
+        }
 
         if ($collectionId !== null) {
-            $owns = Collection::query()
+            $collection = Collection::query()
                 ->whereKey($collectionId)
                 ->where('user_id', $userId)
-                ->exists();
+                ->first();
 
-            if (! $owns) {
+            if (! $collection || $collection->workspace_id != $workspaceId) {
                 throw ValidationException::withMessages([
-                    'collection_id' => ['Collection not found.'],
+                    'collection_id' => ['Collection not found or workspace mismatch.'],
                 ]);
             }
         }
@@ -69,6 +91,7 @@ class SavedRequestController extends Controller
 
         $saved = SavedRequest::create([
             'user_id' => $userId,
+            'workspace_id' => $workspaceId,
             'collection_id' => $collectionId,
             'position' => $max === null ? 0 : $max + 1,
             'name' => $data['name'] ?? null,
@@ -82,6 +105,7 @@ class SavedRequestController extends Controller
             'body_form' => $data['body_form'] ?? null,
             'auth_type' => $data['auth_type'] ?? 'inherit',
             'auth_config' => $data['auth_config'] ?? null,
+            'last_response' => $data['last_response'] ?? null,
         ]);
 
         $saved->load('collection:id,name');
@@ -108,6 +132,7 @@ class SavedRequestController extends Controller
             'body_form' => ['sometimes', 'nullable', 'array'],
             'auth_type' => ['sometimes', 'nullable', 'string', 'in:inherit,none,bearer,basic,api_key'],
             'auth_config' => ['sometimes', 'nullable', 'array'],
+            'last_response' => ['sometimes', 'nullable', 'array'],
         ]);
 
         $userId = $request->user()->getAuthIdentifier();
@@ -176,6 +201,10 @@ class SavedRequestController extends Controller
 
         if (array_key_exists('auth_config', $data)) {
             $updates['auth_config'] = $data['auth_config'];
+        }
+
+        if (array_key_exists('last_response', $data)) {
+            $updates['last_response'] = $data['last_response'];
         }
 
         if ($updates !== []) {

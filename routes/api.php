@@ -22,8 +22,14 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::middleware('throttle:proxy')->post('proxy/send', [ProxyController::class, 'send']);
 
     Route::get('collections/export', [CollectionController::class, 'export']);
+    Route::get('collections/{collection}/export', [CollectionController::class, 'exportSingle']);
     Route::post('collections/import', [CollectionController::class, 'import']);
     Route::apiResource('collections', CollectionController::class)->except(['show']);
+
+    Route::apiResource('workspaces', \App\Http\Controllers\WorkspaceController::class);
+    Route::post('workspaces/{workspace}/invite', [\App\Http\Controllers\WorkspaceController::class, 'invite']);
+    Route::delete('workspaces/{workspace}/users/{user}', [\App\Http\Controllers\WorkspaceController::class, 'removeUser']);
+    Route::post('workspaces/join/{token}', [\App\Http\Controllers\WorkspaceController::class, 'join']);
 
     Route::post('requests/reorder', [SavedRequestController::class, 'reorder']);
     Route::apiResource('requests', SavedRequestController::class)

@@ -20,11 +20,44 @@ class AuthController extends Controller
             'password' => ['required', 'string', 'min:8'],
         ]);
 
-        $user = User::create($data);
+        $user = \Illuminate\Support\Facades\DB::transaction(function () use ($data) {
+            $user = User::create($data);
+
+            // 1. Check for pending invites
+            $invites = \App\Models\WorkspaceInvite::where('email', $data['email'])
+                ->where('status', 'pending')
+                ->get();
+
+            if ($invites->isNotEmpty()) {
+                foreach ($invites as $invite) {
+                    $workspace = $invite->workspace;
+                    if ($workspace) {
+                        $workspace->users()->attach($user->id, [
+                            'role' => $invite->role,
+                            'joined_at' => now(),
+                        ]);
+                        $invite->update(['status' => 'accepted']);
+                    }
+                }
+            } else {
+                // 2. Create a default "My Workspace" for new users
+                $workspace = \App\Models\Workspace::create([
+                    'name' => 'My Workspace',
+                    'owner_id' => $user->id,
+                ]);
+
+                $workspace->users()->attach($user->id, [
+                    'role' => 'admin',
+                    'joined_at' => now(),
+                ]);
+            }
+
+            return $user;
+        });
 
         return response()->json([
             'token' => $user->createToken('auth')->plainTextToken,
-            'user' => $user,
+            'user' => $user->load('workspaces'),
         ]);
     }
 
@@ -45,7 +78,7 @@ class AuthController extends Controller
 
         return response()->json([
             'token' => $user->createToken('auth')->plainTextToken,
-            'user' => $user,
+            'user' => $user->load('workspaces'),
         ]);
     }
 
@@ -58,7 +91,7 @@ class AuthController extends Controller
 
     public function me(Request $request)
     {
-        return response()->json(['user' => $request->user()]);
+        return response()->json(['user' => $request->user()->load('workspaces')]);
     }
 
     public function forgotPassword(Request $request)

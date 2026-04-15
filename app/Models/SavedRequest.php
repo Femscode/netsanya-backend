@@ -12,6 +12,7 @@ class SavedRequest extends Model
 
     protected $fillable = [
         'user_id',
+        'workspace_id',
         'collection_id',
         'position',
         'name',
@@ -25,6 +26,7 @@ class SavedRequest extends Model
         'body_form',
         'auth_type',
         'auth_config',
+        'last_response',
     ];
 
     protected $casts = [
@@ -33,7 +35,13 @@ class SavedRequest extends Model
         'body' => 'array',
         'body_form' => 'array',
         'auth_config' => 'array',
+        'last_response' => 'array',
     ];
+
+    public function workspace(): BelongsTo
+    {
+        return $this->belongsTo(Workspace::class);
+    }
 
     public function user(): BelongsTo
     {

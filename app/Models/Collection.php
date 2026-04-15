@@ -13,6 +13,7 @@ class Collection extends Model
 
     protected $fillable = [
         'user_id',
+        'workspace_id',
         'name',
         'auth_type',
         'auth_config',
@@ -23,6 +24,11 @@ class Collection extends Model
         'auth_config' => 'array',
         'variables' => 'array',
     ];
+
+    public function workspace(): BelongsTo
+    {
+        return $this->belongsTo(Workspace::class);
+    }
 
     public function user(): BelongsTo
     {

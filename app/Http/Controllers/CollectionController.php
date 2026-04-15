@@ -12,11 +12,25 @@ class CollectionController extends Controller
 {
     public function index(Request $request)
     {
-        $collections = Collection::query()
-            ->where('user_id', $request->user()->getAuthIdentifier())
+        $workspaceId = $request->query('workspace_id');
+        
+        $query = Collection::query()
             ->withCount('requests')
-            ->orderBy('name')
-            ->get();
+            ->orderBy('name');
+
+        if ($workspaceId) {
+            // Ensure user belongs to this workspace
+            if (!$request->user()->workspaces()->where('workspace_id', $workspaceId)->exists()) {
+                return response()->json(['message' => 'Unauthorized'], 403);
+            }
+            $query->where('workspace_id', $workspaceId);
+        } else {
+            // Fallback or list all from user's workspaces?
+            // Let's require workspace_id or return empty for safety
+            $query->whereIn('workspace_id', $request->user()->workspaces()->pluck('workspaces.id'));
+        }
+
+        $collections = $query->get();
 
         return response()->json(['data' => $collections]);
     }
@@ -24,14 +38,21 @@ class CollectionController extends Controller
     public function store(Request $request)
     {
         $data = $request->validate([
+            'workspace_id' => ['required', 'exists:workspaces,id'],
             'name' => ['required', 'string', 'max:100'],
             'auth_type' => ['sometimes', 'nullable', 'string', 'in:inherit,none,bearer,basic,api_key'],
             'auth_config' => ['sometimes', 'nullable', 'array'],
             'variables' => ['sometimes', 'nullable', 'array', 'max:200'],
         ]);
 
+        // Ensure user belongs to the workspace
+        if (!$request->user()->workspaces()->where('workspace_id', $data['workspace_id'])->exists()) {
+            return response()->json(['message' => 'Unauthorized'], 403);
+        }
+
         $collection = Collection::create([
             'user_id' => $request->user()->getAuthIdentifier(),
+            'workspace_id' => $data['workspace_id'],
             'name' => $data['name'],
             'auth_type' => $data['auth_type'] ?? null,
             'auth_config' => $data['auth_config'] ?? null,
@@ -73,9 +94,14 @@ class CollectionController extends Controller
     public function export(Request $request)
     {
         $userId = $request->user()->getAuthIdentifier();
+        $workspaceId = $request->query('workspace_id');
 
-        $collections = Collection::query()
-            ->where('user_id', $userId)
+        $query = Collection::query()->where('user_id', $userId);
+        if ($workspaceId) {
+            $query->where('workspace_id', $workspaceId);
+        }
+
+        $collections = $query
             ->with(['requests' => function ($query) use ($userId) {
                 $query
                     ->where('user_id', $userId)
@@ -85,9 +111,15 @@ class CollectionController extends Controller
             ->orderBy('name')
             ->get();
 
-        $ungrouped = SavedRequest::query()
+        $savedRequestQuery = SavedRequest::query()
             ->where('user_id', $userId)
-            ->whereNull('collection_id')
+            ->whereNull('collection_id');
+        
+        if ($workspaceId) {
+            $savedRequestQuery->where('workspace_id', $workspaceId);
+        }
+
+        $ungrouped = $savedRequestQuery
             ->orderBy('position')
             ->orderBy('id')
             ->get();
@@ -97,6 +129,41 @@ class CollectionController extends Controller
         }
 
         return response()->json($this->toNetSanyaExport($collections, $ungrouped));
+    }
+
+    public function exportSingle(Request $request, Collection $collection)
+    {
+        // 🔹 Authorization Check: Ensure the user belongs to the workspace of the collection
+        // OR the collection belongs to the user
+        if ($collection->workspace_id) {
+            $isMember = $request->user()->workspaces()
+                ->where('workspaces.id', $collection->workspace_id)
+                ->exists();
+            if (!$isMember) {
+                return response()->json(['message' => 'Unauthorized access to this workspace.'], 403);
+            }
+        } elseif ($collection->user_id !== $request->user()->id) {
+            return response()->json(['message' => 'Unauthorized access to this collection.'], 403);
+        }
+
+        $collection->load(['requests' => function ($query) {
+            $query->orderBy('position')->orderBy('id');
+        }]);
+
+        $folderItems = [];
+        foreach ($collection->requests as $savedRequest) {
+            $folderItems[] = $this->postmanItemFromSavedRequest($savedRequest);
+        }
+
+        return response()->json([
+            'info' => [
+                'name' => $collection->name,
+                '_postman_id' => str()->uuid()->toString(),
+                'description' => 'Exported from NetSanya',
+                'schema' => 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json',
+            ],
+            'item' => $folderItems,
+        ]);
     }
 
     public function import(Request $request)
@@ -117,53 +184,59 @@ class CollectionController extends Controller
                 $collections = array_merge($collections, $c);
                 $ungrouped = array_merge($ungrouped, $u);
             }
-        } elseif (is_array($payload) && isset($payload['collections']) && is_array($payload['collections'])) {
-            $collections = [];
-            $ungrouped = [];
-
-            foreach ($payload['collections'] as $entry) {
-                if (! is_array($entry) || ! isset($entry['info']) || ! isset($entry['item'])) {
-                    continue;
-                }
-                [$c, $u] = $this->parsePostmanImport($entry);
-                $collections = array_merge($collections, $c);
-                $ungrouped = array_merge($ungrouped, $u);
-            }
         } elseif (is_array($payload) && isset($payload['info']) && isset($payload['item'])) {
+            // Single Postman Collection
             [$collections, $ungrouped] = $this->parsePostmanImport($payload);
-        } else {
-            $data = validator($payload, [
-                'collections' => ['sometimes', 'array', 'max:100'],
-                'collections.*.name' => ['required', 'string', 'max:100'],
-                'collections.*.auth_type' => ['sometimes', 'nullable', 'string', 'in:inherit,none,bearer,basic,api_key'],
-                'collections.*.auth_config' => ['sometimes', 'nullable', 'array'],
-                'collections.*.variables' => ['sometimes', 'nullable', 'array', 'max:200'],
-                'collections.*.requests' => ['sometimes', 'array', 'max:'.$maxRequests],
-                'collections.*.requests.*.name' => ['nullable', 'string', 'max:100'],
-                'collections.*.requests.*.method' => ['required', 'string', 'in:GET,POST,PUT,PATCH,DELETE'],
-                'collections.*.requests.*.url' => ['required', 'string', 'max:2048'],
-                'collections.*.requests.*.query' => ['sometimes', 'nullable', 'array'],
-                'collections.*.requests.*.headers' => ['nullable', 'array', 'max:50'],
-                'collections.*.requests.*.body_type' => ['sometimes', 'string', 'in:none,json,raw,form-data,x-www-form-urlencoded,binary'],
-                'collections.*.requests.*.body' => ['sometimes', 'nullable', 'array'],
-                'collections.*.requests.*.body_text' => ['sometimes', 'nullable', 'string', 'max:2000000'],
-                'collections.*.requests.*.body_form' => ['sometimes', 'nullable', 'array'],
-                'collections.*.requests.*.auth_type' => ['sometimes', 'nullable', 'string', 'in:inherit,none,bearer,basic,api_key'],
-                'collections.*.requests.*.auth_config' => ['sometimes', 'nullable', 'array'],
-                'ungrouped_requests' => ['sometimes', 'array', 'max:'.$maxRequests],
-                'ungrouped_requests.*.name' => ['nullable', 'string', 'max:100'],
-                'ungrouped_requests.*.method' => ['required', 'string', 'in:GET,POST,PUT,PATCH,DELETE'],
-                'ungrouped_requests.*.url' => ['required', 'string', 'max:2048'],
-                'ungrouped_requests.*.query' => ['sometimes', 'nullable', 'array'],
-                'ungrouped_requests.*.headers' => ['nullable', 'array', 'max:50'],
-                'ungrouped_requests.*.body_type' => ['sometimes', 'string', 'in:none,json,raw,form-data,x-www-form-urlencoded,binary'],
-                'ungrouped_requests.*.body' => ['sometimes', 'nullable', 'array'],
-                'ungrouped_requests.*.body_text' => ['sometimes', 'nullable', 'string', 'max:2000000'],
-                'ungrouped_requests.*.body_form' => ['sometimes', 'nullable', 'array'],
-                'ungrouped_requests.*.auth_type' => ['sometimes', 'nullable', 'string', 'in:inherit,none,bearer,basic,api_key'],
-                'ungrouped_requests.*.auth_config' => ['sometimes', 'nullable', 'array'],
-            ])->validate();
+        } elseif (is_array($payload) && isset($payload['collections']) && is_array($payload['collections'])) {
+            // This could be Bulk Postman OR NetSanya Export
+            $first = $payload['collections'][0] ?? null;
+            if ($first && is_array($first) && isset($first['info']) && isset($first['item'])) {
+                // Bulk Postman items
+                $collections = [];
+                $ungrouped = [];
+                foreach ($payload['collections'] as $entry) {
+                    [$c, $u] = $this->parsePostmanImport($entry);
+                    $collections = array_merge($collections, $c);
+                    $ungrouped = array_merge($ungrouped, $u);
+                }
+            } else {
+                // FALL THROUGH to NetSanya format (handled by validator below)
+                $data = validator($payload, [
+                    'collections' => ['sometimes', 'array', 'max:100'],
+                    'collections.*.name' => ['required', 'string', 'max:100'],
+                    'collections.*.auth_type' => ['sometimes', 'nullable', 'string', 'in:inherit,none,bearer,basic,api_key'],
+                    'collections.*.auth_config' => ['sometimes', 'nullable', 'array'],
+                    'collections.*.variables' => ['sometimes', 'nullable', 'array', 'max:200'],
+                    'collections.*.requests' => ['sometimes', 'array', 'max:'.$maxRequests],
+                    'collections.*.requests.*.name' => ['nullable', 'string', 'max:100'],
+                    'collections.*.requests.*.method' => ['required', 'string', 'in:GET,POST,PUT,PATCH,DELETE'],
+                    'collections.*.requests.*.url' => ['required', 'string', 'max:2048'],
+                    'collections.*.requests.*.query' => ['sometimes', 'nullable', 'array'],
+                    'collections.*.requests.*.headers' => ['nullable', 'array', 'max:50'],
+                    'collections.*.requests.*.body_type' => ['sometimes', 'string', 'in:none,json,raw,form-data,x-www-form-urlencoded,binary'],
+                    'collections.*.requests.*.body' => ['sometimes', 'nullable', 'array'],
+                    'collections.*.requests.*.body_text' => ['sometimes', 'nullable', 'string', 'max:2000000'],
+                    'collections.*.requests.*.body_form' => ['sometimes', 'nullable', 'array'],
+                    'collections.*.requests.*.auth_type' => ['sometimes', 'nullable', 'string', 'in:inherit,none,bearer,basic,api_key'],
+                    'collections.*.requests.*.auth_config' => ['sometimes', 'nullable', 'array'],
+                    'ungrouped_requests' => ['sometimes', 'array', 'max:'.$maxRequests],
+                    'ungrouped_requests.*.name' => ['nullable', 'string', 'max:100'],
+                    'ungrouped_requests.*.method' => ['required', 'string', 'in:GET,POST,PUT,PATCH,DELETE'],
+                    'ungrouped_requests.*.url' => ['required', 'string', 'max:2048'],
+                    'ungrouped_requests.*.query' => ['sometimes', 'nullable', 'array'],
+                    'ungrouped_requests.*.headers' => ['nullable', 'array', 'max:50'],
+                    'ungrouped_requests.*.body_type' => ['sometimes', 'string', 'in:none,json,raw,form-data,x-www-form-urlencoded,binary'],
+                    'ungrouped_requests.*.body' => ['sometimes', 'nullable', 'array'],
+                    'ungrouped_requests.*.body_text' => ['sometimes', 'nullable', 'string', 'max:2000000'],
+                    'ungrouped_requests.*.body_form' => ['sometimes', 'nullable', 'array'],
+                    'ungrouped_requests.*.auth_type' => ['sometimes', 'nullable', 'string', 'in:inherit,none,bearer,basic,api_key'],
+                    'ungrouped_requests.*.auth_config' => ['sometimes', 'nullable', 'array'],
+                ])->validate();
 
+                $collections = $data['collections'] ?? [];
+                $ungrouped = $data['ungrouped_requests'] ?? [];
+            }
+        } else {
             $collections = $data['collections'] ?? [];
             $ungrouped = $data['ungrouped_requests'] ?? [];
         }
@@ -180,14 +253,25 @@ class CollectionController extends Controller
         }
 
         $userId = $request->user()->getAuthIdentifier();
+        $workspaceId = $request->input('workspace_id');
 
-        $result = DB::transaction(function () use ($collections, $ungrouped, $userId) {
+        if (!$workspaceId) {
+            return response()->json(['message' => 'workspace_id is required'], 422);
+        }
+
+        // Ensure user belongs to the workspace
+        if (!$request->user()->workspaces()->where('workspace_id', $workspaceId)->exists()) {
+            return response()->json(['message' => 'Unauthorized'], 403);
+        }
+
+        $result = DB::transaction(function () use ($collections, $ungrouped, $userId, $workspaceId) {
             $createdCollections = 0;
             $createdRequests = 0;
 
             foreach ($collections as $collectionData) {
                 $collection = Collection::create([
                     'user_id' => $userId,
+                    'workspace_id' => $workspaceId,
                     'name' => $collectionData['name'],
                     'auth_type' => $collectionData['auth_type'] ?? null,
                     'auth_config' => $collectionData['auth_config'] ?? null,
@@ -199,6 +283,7 @@ class CollectionController extends Controller
                 foreach (array_values($requests) as $index => $req) {
                     SavedRequest::create([
                         'user_id' => $userId,
+                        'workspace_id' => $workspaceId,
                         'collection_id' => $collection->id,
                         'position' => $index,
                         'name' => $req['name'] ?? null,
@@ -220,6 +305,7 @@ class CollectionController extends Controller
             foreach (array_values($ungrouped) as $index => $req) {
                 SavedRequest::create([
                     'user_id' => $userId,
+                    'workspace_id' => $workspaceId,
                     'collection_id' => null,
                     'position' => $index,
                     'name' => $req['name'] ?? null,
@@ -491,12 +577,15 @@ class CollectionController extends Controller
                 continue;
             }
 
+            // 🔹 Improvement: If there are requests at the root level of a Postman collection,
+            // we use the collection name as the folder name. This ensures that individual exports
+            // (which are single collections) are correctly re-imported as collections instead of ungrouped requests.
             if ($folderPath === []) {
-                $ungrouped[] = $normalized;
-                continue;
+                $folderName = $info['name'] ?? 'Imported Collection';
+            } else {
+                $folderName = implode(' / ', $folderPath);
             }
 
-            $folderName = implode(' / ', $folderPath);
             if (! array_key_exists($folderName, $folderIndex)) {
                 $folderIndex[$folderName] = count($collections);
                 $collections[] = [
