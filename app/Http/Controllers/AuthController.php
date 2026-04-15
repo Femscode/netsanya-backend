@@ -9,6 +9,7 @@ use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Password;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
+use Laravel\Socialite\Facades\Socialite;
 
 class AuthController extends Controller
 {
@@ -133,5 +134,74 @@ class AuthController extends Controller
         }
 
         return response()->json(['ok' => true]);
+    }
+
+    public function googleRedirect()
+    {
+        return Socialite::driver('google')->stateless()->redirect();
+    }
+
+    public function googleCallback()
+    {
+        try {
+            $googleUser = Socialite::driver('google')->stateless()->user();
+        } catch (\Exception $e) {
+            return redirect(env('FRONTEND_URL', 'http://localhost:3000') . '/login?error=google_failed');
+        }
+
+        $user = User::where('google_id', $googleUser->id)
+            ->orWhere('email', $googleUser->email)
+            ->first();
+
+        if ($user) {
+            $user->update([
+                'google_id' => $googleUser->id,
+                'avatar' => $googleUser->avatar,
+            ]);
+        } else {
+            $user = \Illuminate\Support\Facades\DB::transaction(function () use ($googleUser) {
+                $user = User::create([
+                    'name' => $googleUser->name,
+                    'email' => $googleUser->email,
+                    'google_id' => $googleUser->id,
+                    'avatar' => $googleUser->avatar,
+                    'password' => null,
+                ]);
+
+                // Create default workspace logic (same as register)
+                $invites = \App\Models\WorkspaceInvite::where('email', $googleUser->email)
+                    ->where('status', 'pending')
+                    ->get();
+
+                if ($invites->isNotEmpty()) {
+                    foreach ($invites as $invite) {
+                        $workspace = $invite->workspace;
+                        if ($workspace) {
+                            $workspace->users()->attach($user->id, [
+                                'role' => $invite->role,
+                                'joined_at' => now(),
+                            ]);
+                            $invite->update(['status' => 'accepted']);
+                        }
+                    }
+                } else {
+                    $workspace = \App\Models\Workspace::create([
+                        'name' => 'My Workspace',
+                        'owner_id' => $user->id,
+                    ]);
+
+                    $workspace->users()->attach($user->id, [
+                        'role' => 'admin',
+                        'joined_at' => now(),
+                    ]);
+                }
+
+                return $user;
+            });
+        }
+
+        $token = $user->createToken('auth')->plainTextToken;
+
+        return redirect(env('FRONTEND_URL', 'http://localhost:3000') . '/auth/callback?token=' . $token);
     }
 }

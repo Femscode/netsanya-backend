@@ -16,7 +16,6 @@ class SavedRequestController extends Controller
         $userId = $request->user()->getAuthIdentifier();
 
         $query = SavedRequest::query()
-            ->where('user_id', $userId)
             ->with('collection:id,name');
 
         if ($workspaceId) {
@@ -28,6 +27,7 @@ class SavedRequestController extends Controller
         } else {
             // Fallback to all user's workspaces
             $query->whereIn('workspace_id', $request->user()->workspaces()->pluck('workspaces.id'));
+            $query->where('user_id', $userId);
         }
 
         if ($request->filled('collection_id')) {
@@ -74,7 +74,6 @@ class SavedRequestController extends Controller
         if ($collectionId !== null) {
             $collection = Collection::query()
                 ->whereKey($collectionId)
-                ->where('user_id', $userId)
                 ->first();
 
             if (! $collection || $collection->workspace_id != $workspaceId) {
@@ -85,7 +84,7 @@ class SavedRequestController extends Controller
         }
 
         $max = SavedRequest::query()
-            ->where('user_id', $userId)
+            ->where('workspace_id', $workspaceId)
             ->when($collectionId === null, fn ($q) => $q->whereNull('collection_id'), fn ($q) => $q->where('collection_id', $collectionId))
             ->max('position');
 
@@ -115,8 +114,9 @@ class SavedRequestController extends Controller
 
     public function update(Request $request, SavedRequest $savedRequest)
     {
-        if ($savedRequest->user_id !== $request->user()->getAuthIdentifier()) {
-            abort(404);
+        // Ensure user belongs to the workspace
+        if (!$request->user()->workspaces()->where('workspace_id', $savedRequest->workspace_id)->exists()) {
+             abort(403);
         }
 
         $data = $request->validate([
@@ -143,7 +143,7 @@ class SavedRequestController extends Controller
         if ($hasCollectionId && $collectionId !== null) {
             $owns = Collection::query()
                 ->whereKey($collectionId)
-                ->where('user_id', $userId)
+                ->where('workspace_id', $savedRequest->workspace_id)
                 ->exists();
 
             if (! $owns) {
@@ -218,8 +218,9 @@ class SavedRequestController extends Controller
 
     public function destroy(Request $request, SavedRequest $savedRequest)
     {
-        if ($savedRequest->user_id !== $request->user()->getAuthIdentifier()) {
-            abort(404);
+        // Ensure user belongs to the workspace
+        if (!$request->user()->workspaces()->where('workspace_id', $savedRequest->workspace_id)->exists()) {
+             abort(403);
         }
 
         $savedRequest->delete();
@@ -241,14 +242,18 @@ class SavedRequestController extends Controller
         $items = $data['items'];
         $requestIds = array_values(array_unique(array_map(fn ($i) => (int) $i['id'], $items)));
 
+        // We should really check if the user belongs to the workspaces of these requests.
+        // For now, let's assume they are all in the active workspace and check that.
+        // But reorder is usually called from the UI which already filters by workspace.
+        
         $ownedRequestIds = SavedRequest::query()
-            ->where('user_id', $userId)
+            ->whereIn('workspace_id', $request->user()->workspaces()->pluck('workspaces.id'))
             ->whereIn('id', $requestIds)
             ->pluck('id')
             ->all();
 
         if (count($ownedRequestIds) !== count($requestIds)) {
-            abort(404);
+            abort(403);
         }
 
         $collectionIds = array_values(array_unique(array_filter(array_map(
@@ -258,7 +263,7 @@ class SavedRequestController extends Controller
 
         if ($collectionIds !== []) {
             $ownedCollectionCount = Collection::query()
-                ->where('user_id', $userId)
+                ->whereIn('workspace_id', $request->user()->workspaces()->pluck('workspaces.id'))
                 ->whereIn('id', $collectionIds)
                 ->count();
 
@@ -269,12 +274,14 @@ class SavedRequestController extends Controller
             }
         }
 
-        DB::transaction(function () use ($items, $userId) {
+        DB::transaction(function () use ($items, $userId, $request) {
+            $userWorkspaces = $request->user()->workspaces()->pluck('workspaces.id')->all();
+            
             foreach ($items as $item) {
                 $collectionId = $item['collection_id'] ?? null;
 
                 SavedRequest::query()
-                    ->where('user_id', $userId)
+                    ->whereIn('workspace_id', $userWorkspaces)
                     ->whereKey((int) $item['id'])
                     ->update([
                         'collection_id' => $collectionId,

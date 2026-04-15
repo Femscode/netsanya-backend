@@ -13,7 +13,7 @@ class CollectionController extends Controller
     public function index(Request $request)
     {
         $workspaceId = $request->query('workspace_id');
-        
+
         $query = Collection::query()
             ->withCount('requests')
             ->orderBy('name');
@@ -64,8 +64,9 @@ class CollectionController extends Controller
 
     public function update(Request $request, Collection $collection)
     {
-        if ($collection->user_id !== $request->user()->getAuthIdentifier()) {
-            abort(404);
+        // Ensure user belongs to the workspace of this collection
+        if (!$request->user()->workspaces()->where('workspace_id', $collection->workspace_id)->exists()) {
+             abort(403);
         }
 
         $data = $request->validate([
@@ -82,8 +83,9 @@ class CollectionController extends Controller
 
     public function destroy(Request $request, Collection $collection)
     {
-        if ($collection->user_id !== $request->user()->getAuthIdentifier()) {
-            abort(404);
+        // Ensure user belongs to the workspace of this collection
+        if (!$request->user()->workspaces()->where('workspace_id', $collection->workspace_id)->exists()) {
+             abort(403);
         }
 
         $collection->delete();
@@ -96,15 +98,20 @@ class CollectionController extends Controller
         $userId = $request->user()->getAuthIdentifier();
         $workspaceId = $request->query('workspace_id');
 
-        $query = Collection::query()->where('user_id', $userId);
+        $query = Collection::query();
         if ($workspaceId) {
+            // Ensure user belongs to this workspace
+            if (!$request->user()->workspaces()->where('workspace_id', $workspaceId)->exists()) {
+                return response()->json(['message' => 'Unauthorized'], 403);
+            }
             $query->where('workspace_id', $workspaceId);
+        } else {
+             $query->where('user_id', $userId);
         }
 
         $collections = $query
-            ->with(['requests' => function ($query) use ($userId) {
+            ->with(['requests' => function ($query) {
                 $query
-                    ->where('user_id', $userId)
                     ->orderBy('position')
                     ->orderBy('id');
             }])
@@ -112,11 +119,12 @@ class CollectionController extends Controller
             ->get();
 
         $savedRequestQuery = SavedRequest::query()
-            ->where('user_id', $userId)
             ->whereNull('collection_id');
-        
+
         if ($workspaceId) {
             $savedRequestQuery->where('workspace_id', $workspaceId);
+        } else {
+             $savedRequestQuery->where('user_id', $userId);
         }
 
         $ungrouped = $savedRequestQuery
@@ -207,9 +215,9 @@ class CollectionController extends Controller
                     'collections.*.auth_type' => ['sometimes', 'nullable', 'string', 'in:inherit,none,bearer,basic,api_key'],
                     'collections.*.auth_config' => ['sometimes', 'nullable', 'array'],
                     'collections.*.variables' => ['sometimes', 'nullable', 'array', 'max:200'],
-                    'collections.*.requests' => ['sometimes', 'array', 'max:'.$maxRequests],
+                    'collections.*.requests' => ['sometimes', 'array', 'max:' . $maxRequests],
                     'collections.*.requests.*.name' => ['nullable', 'string', 'max:100'],
-                    'collections.*.requests.*.method' => ['required', 'string', 'in:GET,POST,PUT,PATCH,DELETE'],
+                    'collections.*.requests.*.method' => ['required', 'string'],
                     'collections.*.requests.*.url' => ['required', 'string', 'max:2048'],
                     'collections.*.requests.*.query' => ['sometimes', 'nullable', 'array'],
                     'collections.*.requests.*.headers' => ['nullable', 'array', 'max:50'],
@@ -219,9 +227,9 @@ class CollectionController extends Controller
                     'collections.*.requests.*.body_form' => ['sometimes', 'nullable', 'array'],
                     'collections.*.requests.*.auth_type' => ['sometimes', 'nullable', 'string', 'in:inherit,none,bearer,basic,api_key'],
                     'collections.*.requests.*.auth_config' => ['sometimes', 'nullable', 'array'],
-                    'ungrouped_requests' => ['sometimes', 'array', 'max:'.$maxRequests],
+                    'ungrouped_requests' => ['sometimes', 'array', 'max:' . $maxRequests],
                     'ungrouped_requests.*.name' => ['nullable', 'string', 'max:100'],
-                    'ungrouped_requests.*.method' => ['required', 'string', 'in:GET,POST,PUT,PATCH,DELETE'],
+                    'ungrouped_requests.*.method' => ['required', 'string'],
                     'ungrouped_requests.*.url' => ['required', 'string', 'max:2048'],
                     'ungrouped_requests.*.query' => ['sometimes', 'nullable', 'array'],
                     'ungrouped_requests.*.headers' => ['nullable', 'array', 'max:50'],
@@ -236,9 +244,12 @@ class CollectionController extends Controller
                 $collections = $data['collections'] ?? [];
                 $ungrouped = $data['ungrouped_requests'] ?? [];
             }
+        } elseif (is_array($payload)) {
+            $collections = $payload['collections'] ?? [];
+            $ungrouped = $payload['ungrouped_requests'] ?? [];
         } else {
-            $collections = $data['collections'] ?? [];
-            $ungrouped = $data['ungrouped_requests'] ?? [];
+            $collections = [];
+            $ungrouped = [];
         }
 
         $totalRequests = count($ungrouped);
@@ -248,7 +259,7 @@ class CollectionController extends Controller
 
         if ($totalRequests > $maxRequests) {
             throw ValidationException::withMessages([
-                'collections' => ['Import exceeds maximum allowed requests ('.$maxRequests.').'],
+                'collections' => ['Import exceeds maximum allowed requests (' . $maxRequests . ').'],
             ]);
         }
 
@@ -279,15 +290,19 @@ class CollectionController extends Controller
                 ]);
                 $createdCollections++;
 
-                $requests = $collectionData['requests'] ?? [];
+                $requests = (isset($collectionData['requests']) && is_array($collectionData['requests'])) ? $collectionData['requests'] : [];
                 foreach (array_values($requests) as $index => $req) {
+                    if (!isset($req['url']) || !is_string($req['url'])) {
+                        continue; // Skip malformed requests
+                    }
+
                     SavedRequest::create([
                         'user_id' => $userId,
                         'workspace_id' => $workspaceId,
                         'collection_id' => $collection->id,
                         'position' => $index,
                         'name' => $req['name'] ?? null,
-                        'method' => strtoupper($req['method']),
+                        'method' => strtoupper($req['method'] ?? 'GET'),
                         'url' => $req['url'],
                         'query' => $req['query'] ?? null,
                         'headers' => $req['headers'] ?? null,
@@ -302,14 +317,19 @@ class CollectionController extends Controller
                 }
             }
 
+            $ungrouped = is_array($ungrouped) ? $ungrouped : [];
             foreach (array_values($ungrouped) as $index => $req) {
+                if (!isset($req['url']) || !is_string($req['url'])) {
+                    continue; // Skip malformed requests
+                }
+
                 SavedRequest::create([
                     'user_id' => $userId,
                     'workspace_id' => $workspaceId,
                     'collection_id' => null,
                     'position' => $index,
                     'name' => $req['name'] ?? null,
-                    'method' => strtoupper($req['method']),
+                    'method' => strtoupper($req['method'] ?? 'GET'),
                     'url' => $req['url'],
                     'query' => $req['query'] ?? null,
                     'headers' => $req['headers'] ?? null,
@@ -494,7 +514,7 @@ class CollectionController extends Controller
                 ],
                 'body' => $body,
                 'auth' => $auth,
-            ], fn ($v) => $v !== null),
+            ], fn($v) => $v !== null),
         ];
     }
 
@@ -581,7 +601,7 @@ class CollectionController extends Controller
             // we use the collection name as the folder name. This ensures that individual exports
             // (which are single collections) are correctly re-imported as collections instead of ungrouped requests.
             if ($folderPath === []) {
-                $folderName = $info['name'] ?? 'Imported Collection';
+                $folderName = (isset($info['name']) && is_string($info['name'])) ? $info['name'] : 'Imported Collection';
             } else {
                 $folderName = implode(' / ', $folderPath);
             }
@@ -697,7 +717,7 @@ class CollectionController extends Controller
             if (is_string($url['raw'] ?? null)) {
                 $raw = $url['raw'];
             } else {
-                $scheme = is_string($url['protocol'] ?? null) ? $url['protocol'].'://' : '';
+                $scheme = is_string($url['protocol'] ?? null) ? $url['protocol'] . '://' : '';
                 $host = '';
                 if (is_array($url['host'] ?? null)) {
                     $host = implode('.', array_map('strval', $url['host']));
@@ -706,11 +726,11 @@ class CollectionController extends Controller
                 }
                 $path = '';
                 if (is_array($url['path'] ?? null)) {
-                    $path = '/'.implode('/', array_map('strval', $url['path']));
+                    $path = '/' . implode('/', array_map('strval', $url['path']));
                 } elseif (is_string($url['path'] ?? null)) {
                     $path = $url['path'];
                 }
-                $raw = $scheme.$host.$path;
+                $raw = $scheme . $host . $path;
             }
 
             if (is_array($url['query'] ?? null)) {

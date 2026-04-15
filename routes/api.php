@@ -12,6 +12,9 @@ Route::prefix('auth')->group(function () {
     Route::post('forgot-password', [AuthController::class, 'forgotPassword'])->middleware('throttle:10,1');
     Route::post('reset-password', [AuthController::class, 'resetPassword'])->middleware('throttle:10,1');
 
+    Route::get('google', [AuthController::class, 'googleRedirect']);
+    Route::get('google/callback', [AuthController::class, 'googleCallback']);
+
     Route::middleware('auth:sanctum')->group(function () {
         Route::post('logout', [AuthController::class, 'logout']);
         Route::get('me', [AuthController::class, 'me']);
@@ -27,6 +30,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::apiResource('collections', CollectionController::class)->except(['show']);
 
     Route::apiResource('workspaces', \App\Http\Controllers\WorkspaceController::class);
+    Route::get('workspaces/{workspace}/members', [\App\Http\Controllers\WorkspaceController::class, 'members']);
     Route::post('workspaces/{workspace}/invite', [\App\Http\Controllers\WorkspaceController::class, 'invite']);
     Route::delete('workspaces/{workspace}/users/{user}', [\App\Http\Controllers\WorkspaceController::class, 'removeUser']);
     Route::post('workspaces/join/{token}', [\App\Http\Controllers\WorkspaceController::class, 'join']);
