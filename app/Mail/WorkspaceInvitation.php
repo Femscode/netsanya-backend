@@ -41,7 +41,7 @@ class WorkspaceInvitation extends Mailable
         return new Content(
             markdown: 'emails.workspace-invitation',
             with: [
-                'url' => config('app.frontend_url') . '/app?join=' . $this->token,
+                'url' => 'https://netsanya.connectinskillz.com/app?join=' . $this->token,
             ]
         );
     }
