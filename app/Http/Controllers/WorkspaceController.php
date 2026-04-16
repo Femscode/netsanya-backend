@@ -64,6 +64,7 @@ class WorkspaceController extends Controller
         $data = $request->validate([
             'name' => ['required', 'string', 'max:255'],
             'description' => ['nullable', 'string', 'max:500'],
+            'variables' => ['nullable', 'array'],
         ]);
 
         $workspace->update($data);

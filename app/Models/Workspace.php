@@ -14,6 +14,11 @@ class Workspace extends Model
         'name',
         'owner_id',
         'description',
+        'variables',
+    ];
+    
+    protected $casts = [
+        'variables' => 'array',
     ];
 
     public function owner(): BelongsTo
