@@ -3,11 +3,11 @@
 return [
     'paths' => ['api/*', 'sanctum/csrf-cookie'],
     'allowed_methods' => ['*'],
-    'allowed_origins' => array_values(array_filter([
+    'allowed_origins' => [
         // env('FRONTEND_ORIGIN', 'http://localhost:3000'),
         'https://netsanya.connectinskillz.com',
         'https://www.netsanya.connectinskillz.com',
-    ])),
+    ],
     'allowed_origins_patterns' => [],
     'allowed_headers' => ['*'],
     'exposed_headers' => [],
